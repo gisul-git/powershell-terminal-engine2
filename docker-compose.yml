@@ -1,0 +1,8 @@
+version: "3.8"
+
+services:
+  powershell-engine:
+    build: .
+    ports:
+      - "4042:4042"
+    restart: always
