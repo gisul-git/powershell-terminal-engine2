@@ -1,19 +1,29 @@
 import asyncio
+import logging
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 
 from execution_engine import build_terminal_history, execute_command
-from session_manager import create_session, generate_prompt
+from session_manager import create_session, delete_session, generate_prompt
 
 
 app = FastAPI(title="PowerShell Simulation")
+logger = logging.getLogger(__name__)
 
 
 @app.websocket("/terminal")
 async def terminal_endpoint(websocket: WebSocket) -> None:
+    """
+    PowerShell WebSocket terminal endpoint.
+    Matches Linux bash engine behavior for stability and robustness.
+    """
     await websocket.accept()
+    print("WebSocket connected")
+    
     session = create_session()
-
+    session_id = id(session)
+    
+    # Send INIT message immediately on connection
     await websocket.send_json(
         {
             "type": "init",
@@ -23,14 +33,43 @@ async def terminal_endpoint(websocket: WebSocket) -> None:
             },
         }
     )
+    print("INIT message sent")
 
     try:
         while True:
-            message = await websocket.receive_json()
-            message_type = message.get("type")
+            # Safe message handling - catch invalid JSON/format
+            try:
+                message = await websocket.receive_json()
+                print(f"Received: {message}")
+            except Exception as e:
+                logger.error(f"Invalid message format: {e}")
+                await websocket.send_json(
+                    {
+                        "type": "response",
+                        "data": {
+                            "output": "Invalid input format",
+                            "prompt": generate_prompt(session),
+                        },
+                    }
+                )
+                continue
 
+            message_type = message.get("type")
+            
+            # Ignore unsupported message types (resize, ping)
+            if message_type == "resize":
+                print("Ignoring resize message")
+                continue
+            
+            if message_type == "ping":
+                print("Ignoring ping message")
+                continue
+
+            # Handle command execution
             if message_type == "command":
                 command = str(message.get("data", "")).strip()
+                
+                # Handle special \submit command
                 if command == "\\submit":
                     await asyncio.sleep(0.1)
                     await websocket.send_json(
@@ -39,14 +78,18 @@ async def terminal_endpoint(websocket: WebSocket) -> None:
                             "data": {
                                 "output": build_terminal_history(session),
                                 "prompt": generate_prompt(session),
-                                "clear": False,
                             },
                         }
                     )
+                    print("Sending response: submit history")
                     continue
+                
+                # Execute command
                 prompt_before = generate_prompt(session)
                 result = await execute_command(session, command)
                 prompt_after = generate_prompt(session)
+                
+                # Store in history
                 session["history"].append(
                     {
                         "prompt": prompt_before,
@@ -54,17 +97,26 @@ async def terminal_endpoint(websocket: WebSocket) -> None:
                         "output": result["output"],
                     }
                 )
+                
+                # Send response
+                response_data = {
+                    "output": result["output"],
+                    "prompt": prompt_after,
+                }
+                if result.get("clear"):
+                    response_data["clear"] = True
+                    
                 await websocket.send_json(
                     {
                         "type": "response",
-                        "data": {
-                            "output": result["output"],
-                            "prompt": prompt_after,
-                            "clear": result["clear"],
-                        },
+                        "data": response_data,
                     }
                 )
-            elif message_type == "submit":
+                print("Sending response: command executed")
+                continue
+
+            # Handle submit message type
+            if message_type == "submit":
                 await asyncio.sleep(0.1)
                 await websocket.send_json(
                     {
@@ -72,20 +124,31 @@ async def terminal_endpoint(websocket: WebSocket) -> None:
                         "data": {
                             "output": build_terminal_history(session),
                             "prompt": generate_prompt(session),
-                            "clear": False,
                         },
                     }
                 )
-            else:
-                await websocket.send_json(
-                    {
-                        "type": "response",
-                        "data": {
-                            "output": "Invalid input",
-                            "prompt": generate_prompt(session),
-                            "clear": False,
-                        },
-                    }
-                )
+                print("Sending response: submit history")
+                continue
+
+            # Unsupported message type
+            print(f"Unsupported message type: {message_type}")
+            await websocket.send_json(
+                {
+                    "type": "response",
+                    "data": {
+                        "output": f"Unsupported message type: {message_type}",
+                        "prompt": generate_prompt(session),
+                    },
+                }
+            )
+            
     except WebSocketDisconnect:
-        return
+        print("WebSocket disconnected")
+        delete_session(session_id)
+    except Exception as e:
+        logger.error(f"WebSocket error: {e}")
+        delete_session(session_id)
+        try:
+            await websocket.close()
+        except Exception:
+            pass

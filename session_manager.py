@@ -8,10 +8,13 @@ DEFAULT_PROCESSES = [
     {"pid": 102, "name": "node"},
 ]
 
+# Session storage for cleanup
+_sessions = {}
+
 
 def create_session() -> dict:
     cwd = HOME_PATH
-    return {
+    session = {
         "cwd": cwd,
         "fs": {
             ROOT_PATH: {
@@ -32,6 +35,13 @@ def create_session() -> dict:
         "processes": deepcopy(DEFAULT_PROCESSES),
         "mode": "exam",
     }
+    _sessions[id(session)] = session
+    return session
+
+
+def delete_session(session_id: int) -> None:
+    """Clean up session on disconnect"""
+    _sessions.pop(session_id, None)
 
 
 def generate_prompt(session: dict) -> str:
