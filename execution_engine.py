@@ -10,12 +10,16 @@ from validation import error, has_flag, validate_flags
 
 
 ALIASES = {
-    "ls": "dir",
+    "ls": "Get-ChildItem",
     "type": "Get-Content",
     "mkdir": "New-Item",
     "copy": "Copy-Item",
     "move": "Move-Item",
     "echo": "Write-Output",
+    "set": "Get-ChildItem",
+    "ipconfig": "Get-NetIPConfiguration",
+    "whoami": "Get-CurrentUser",
+    "hostname": "Get-ComputerName",
 }
 
 logger = logging.getLogger(__name__)
@@ -32,6 +36,7 @@ STOP_ERRORS = {
     error("cannot_remove_directory"),
     error("cannot_move_file"),
     error("same_file"),
+    error("service_not_found"),
 }
 
 
@@ -103,6 +108,12 @@ def normalize_alias(command: str) -> str:
         if len(tokens) < 2:
             return alias
         return " ".join([alias, tokens[1], "-ItemType", "Directory", *tokens[2:]])
+    
+    if tokens[0].lower() == "set":
+        return "Get-ChildItem Env:"
+    
+    if tokens[0].lower() in ["ipconfig", "whoami", "hostname"]:
+        return alias
 
     tokens[0] = alias
     return " ".join(tokens)
@@ -403,6 +414,444 @@ def handle_stop_process(session: dict, tokens: list[str]) -> dict:
     return success(error("item_missing"))
 
 
+def handle_measure_object(piped_input: str) -> dict:
+    if not piped_input:
+        return success("Count : 0")
+    lines = piped_input.splitlines()
+    return success(f"Count : {len(lines)}")
+
+
+def handle_sort_object(session: dict, tokens: list[str], piped_input: str) -> dict:
+    if not piped_input:
+        return success("")
+    
+    lines = piped_input.splitlines()
+    
+    # Check if sorting by a specific property (e.g., Id)
+    sort_by = get_option(tokens, "Id") or get_option(tokens, "-Property")
+    
+    if sort_by and sort_by.lower() == "id":
+        # Try to extract and sort by Id column (for Get-Process output)
+        sorted_lines = []
+        header = None
+        data_lines = []
+        
+        for line in lines:
+            if "Id" in line and "ProcessName" in line:
+                header = line
+            elif line.strip() and not line.startswith("-"):
+                data_lines.append(line)
+        
+        # Extract Id and sort
+        try:
+            parsed = []
+            for line in data_lines:
+                parts = line.split()
+                if len(parts) >= 6:
+                    pid = int(parts[5])
+                    parsed.append((pid, line))
+            parsed.sort(key=lambda x: x[0])
+            sorted_lines = [header] if header else []
+            sorted_lines.extend([line for _, line in parsed])
+            return success("\n".join(sorted_lines))
+        except (ValueError, IndexError):
+            pass
+    
+    # Default: alphabetical sort
+    sorted_lines = sorted(lines)
+    return success("\n".join(sorted_lines))
+
+
+def handle_select_object(tokens: list[str], piped_input: str) -> dict:
+    if not piped_input:
+        return success("")
+    
+    lines = piped_input.splitlines()
+    
+    # Handle -First N
+    first_count = get_option(tokens, "-First")
+    if first_count and first_count.isdigit():
+        selected = lines[:int(first_count)]
+        return success("\n".join(selected))
+    
+    # Handle property selection (Id, ProcessName, etc.)
+    property_name = None
+    for i, token in enumerate(tokens):
+        if i > 0 and not token.startswith("-"):
+            property_name = token
+            break
+    
+    if not property_name:
+        return success(piped_input)
+    
+    # Extract specific column
+    result_lines = []
+    for line in lines:
+        if property_name.lower() == "id":
+            if "Id" in line and "ProcessName" in line:
+                result_lines.append("Id")
+            else:
+                parts = line.split()
+                if len(parts) >= 6:
+                    try:
+                        result_lines.append(parts[5])
+                    except IndexError:
+                        pass
+        elif property_name.lower() == "processname":
+            if "ProcessName" in line:
+                result_lines.append("ProcessName")
+            else:
+                parts = line.split()
+                if len(parts) >= 7:
+                    result_lines.append(parts[6])
+    
+    return success("\n".join(result_lines))
+
+
+def handle_get_date() -> dict:
+    from datetime import datetime
+    now = datetime.now()
+    return success(now.strftime("%Y-%m-%d %H:%M:%S"))
+
+
+def handle_get_location(session: dict) -> dict:
+    lines = ["Path", "----", session["cwd"]]
+    return success("\n".join(lines))
+
+
+def handle_rename_item(session: dict, tokens: list[str]) -> dict:
+    if len(tokens) != 3:
+        return success(error("invalid_arguments"))
+    
+    old_path = normalize_path(session["cwd"], tokens[1])
+    new_name = tokens[2].strip('"').strip("'")
+    
+    old_node = ensure_node(session, old_path)
+    if not old_node:
+        return success(error("file_missing"))
+    
+    # Build new path in same directory
+    parent = parent_path(old_path)
+    new_path = normalize_path(parent, new_name)
+    
+    # Check if new path already exists
+    if ensure_node(session, new_path):
+        return success(error("invalid_arguments"))
+    
+    # Copy node to new location
+    add_child(session, new_path, deepcopy(old_node))
+    
+    # Remove old node
+    delete_node(session, old_path)
+    
+    return success()
+
+
+def handle_get_childitem_env(session: dict) -> dict:
+    if not session["env"]:
+        return success("Name        Value\n----        -----")
+    
+    lines = ["Name        Value", "----        -----"]
+    for key, value in sorted(session["env"].items()):
+        lines.append(f"{key:<12}{value}")
+    return success("\n".join(lines))
+
+
+def handle_get_childitem(session: dict, tokens: list[str]) -> dict:
+    """Enhanced Get-ChildItem / dir / ls"""
+    # Check if it's Env: request
+    if len(tokens) == 2 and tokens[1].lower() == "env:":
+        return handle_get_childitem_env(session)
+    
+    # Otherwise list directory
+    if len(tokens) > 2:
+        return success(error("invalid_arguments"))
+    
+    target = normalize_path(session["cwd"], tokens[1] if len(tokens) > 1 else None)
+    directory = ensure_dir(session, target)
+    if not directory:
+        return success(error("path_missing"))
+    
+    lines = ["Mode   Name", "----   ----"]
+    for name in sorted(directory["children"]):
+        child = session["fs"][directory["children"][name]]
+        mode = "Dir " if child["type"] == "dir" else "File"
+        lines.append(f"{mode:<6} {name}")
+    return success("\n".join(lines))
+
+
+def handle_get_item(session: dict, tokens: list[str]) -> dict:
+    """Get-Item - Return details of file/folder"""
+    if len(tokens) != 2:
+        return success(error("invalid_arguments"))
+    
+    target_path = normalize_path(session["cwd"], tokens[1])
+    node = ensure_node(session, target_path)
+    
+    if not node:
+        return success(error("item_missing"))
+    
+    name = basename(target_path)
+    item_type = "Directory" if node["type"] == "dir" else "File"
+    
+    lines = [f"Name : {name}", f"Type : {item_type}"]
+    
+    if node["type"] == "file":
+        size = len(node.get("content", ""))
+        lines.append(f"Size : {size}")
+    
+    return success("\n".join(lines))
+
+
+def handle_test_path(session: dict, tokens: list[str]) -> dict:
+    """Test-Path - Check if path exists"""
+    if len(tokens) != 2:
+        return success(error("invalid_arguments"))
+    
+    target_path = normalize_path(session["cwd"], tokens[1])
+    node = ensure_node(session, target_path)
+    
+    return success("True" if node else "False")
+
+
+def handle_get_service(session: dict) -> dict:
+    """Get-Service - List Windows services"""
+    lines = ["Status   Name", "------   ----"]
+    for service in session["services"]:
+        lines.append(f"{service['status']:<8} {service['name']}")
+    return success("\n".join(lines))
+
+
+def handle_start_service(session: dict, tokens: list[str]) -> dict:
+    """Start-Service - Start a Windows service"""
+    if len(tokens) != 2:
+        return success(error("invalid_arguments"))
+    
+    service_name = tokens[1].strip('"').strip("'")
+    
+    for service in session["services"]:
+        if service["name"].lower() == service_name.lower():
+            service["status"] = "Running"
+            return success()
+    
+    return success(error("service_not_found"))
+
+
+def handle_stop_service(session: dict, tokens: list[str]) -> dict:
+    """Stop-Service - Stop a Windows service"""
+    if len(tokens) != 2:
+        return success(error("invalid_arguments"))
+    
+    service_name = tokens[1].strip('"').strip("'")
+    
+    for service in session["services"]:
+        if service["name"].lower() == service_name.lower():
+            service["status"] = "Stopped"
+            return success()
+    
+    return success(error("service_not_found"))
+
+
+def handle_restart_service(session: dict, tokens: list[str]) -> dict:
+    """Restart-Service - Restart a Windows service"""
+    if len(tokens) != 2:
+        return success(error("invalid_arguments"))
+    
+    service_name = tokens[1].strip('"').strip("'")
+    
+    for service in session["services"]:
+        if service["name"].lower() == service_name.lower():
+            service["status"] = "Running"
+            return success()
+    
+    return success(error("service_not_found"))
+
+
+def handle_test_connection(tokens: list[str]) -> dict:
+    """Test-Connection - Simulated ping"""
+    if len(tokens) != 2:
+        return success(error("invalid_arguments"))
+    
+    target = tokens[1].strip('"').strip("'")
+    
+    lines = [
+        f"Reply from {target}",
+        f"Reply from {target}",
+        "Packets: Sent = 2, Received = 2"
+    ]
+    return success("\n".join(lines))
+
+
+def handle_ipconfig() -> dict:
+    """ipconfig / Get-NetIPConfiguration - Network info"""
+    lines = [
+        "IPv4 Address . . . . . : 192.168.1.10",
+        "Subnet Mask . . . . . : 255.255.255.0",
+        "Gateway . . . . . . . : 192.168.1.1"
+    ]
+    return success("\n".join(lines))
+
+
+def handle_resolve_dnsname(tokens: list[str]) -> dict:
+    """Resolve-DnsName - DNS lookup"""
+    if len(tokens) != 2:
+        return success(error("invalid_arguments"))
+    
+    target = tokens[1].strip('"').strip("'")
+    
+    lines = [
+        f"Name : {target}",
+        "Address : 142.250.0.1"
+    ]
+    return success("\n".join(lines))
+
+
+def handle_whoami() -> dict:
+    """whoami / Get-CurrentUser - Current user"""
+    return success("User")
+
+
+def handle_hostname() -> dict:
+    """hostname / Get-ComputerName - Computer name"""
+    return success("WIN-SERVER01")
+
+
+def handle_get_computerinfo() -> dict:
+    """Get-ComputerInfo - System information"""
+    lines = [
+        "OSName : Windows Server",
+        "OSVersion : 2022",
+        "ComputerName : WIN-SERVER01"
+    ]
+    return success("\n".join(lines))
+
+
+def handle_compress_archive(session: dict, tokens: list[str]) -> dict:
+    """Compress-Archive - Create zip file"""
+    if len(tokens) != 3:
+        return success(error("invalid_arguments"))
+    
+    source_path = normalize_path(session["cwd"], tokens[1])
+    dest_path = normalize_path(session["cwd"], tokens[2])
+    
+    source_node = ensure_file(session, source_path)
+    if not source_node:
+        return success(error("file_missing"))
+    
+    # Create zip file with archived content
+    dest_parent = ensure_dir(session, parent_path(dest_path))
+    if not dest_parent:
+        return success(error("path_missing"))
+    
+    # Store original content in metadata
+    zip_node = {
+        "type": "file",
+        "content": f"[Compressed: {basename(source_path)}]",
+        "metadata": {
+            "archive": True,
+            "original_content": source_node["content"],
+            "original_name": basename(source_path)
+        }
+    }
+    
+    add_child(session, dest_path, zip_node)
+    return success()
+
+
+def handle_expand_archive(session: dict, tokens: list[str]) -> dict:
+    """Expand-Archive - Extract zip file"""
+    if len(tokens) != 3:
+        return success(error("invalid_arguments"))
+    
+    source_path = normalize_path(session["cwd"], tokens[1])
+    dest_path = normalize_path(session["cwd"], tokens[2])
+    
+    source_node = ensure_file(session, source_path)
+    if not source_node:
+        return success(error("file_missing"))
+    
+    # Check if it's an archive
+    if not source_node.get("metadata", {}).get("archive"):
+        return success(error("invalid_arguments"))
+    
+    # Extract content
+    dest_parent = ensure_dir(session, parent_path(dest_path))
+    if not dest_parent:
+        return success(error("path_missing"))
+    
+    original_content = source_node["metadata"].get("original_content", "")
+    extracted_node = {
+        "type": "file",
+        "content": original_content,
+        "metadata": {}
+    }
+    
+    add_child(session, dest_path, extracted_node)
+    return success()
+
+
+def handle_where_object(tokens: list[str], piped_input: str) -> dict:
+    """Where-Object - Filter objects"""
+    if not piped_input:
+        return success("")
+    
+    if len(tokens) < 4:
+        return success(error("invalid_arguments"))
+    
+    property_name = tokens[1]
+    operator = tokens[2]
+    value = tokens[3]
+    
+    lines = piped_input.splitlines()
+    result_lines = []
+    
+    # Handle Get-Process output filtering
+    if property_name.lower() == "id":
+        for line in lines:
+            if "Id" in line and "ProcessName" in line:
+                result_lines.append(line)
+                continue
+            
+            parts = line.split()
+            if len(parts) >= 6:
+                try:
+                    pid = int(parts[5])
+                    target_value = int(value)
+                    
+                    if operator == "-gt" and pid > target_value:
+                        result_lines.append(line)
+                    elif operator == "-lt" and pid < target_value:
+                        result_lines.append(line)
+                    elif operator == "-eq" and pid == target_value:
+                        result_lines.append(line)
+                except (ValueError, IndexError):
+                    pass
+    
+    # Handle Name filtering for Get-ChildItem
+    elif property_name.lower() == "name":
+        for line in lines:
+            if "Name" in line:
+                result_lines.append(line)
+                continue
+            
+            parts = line.split()
+            if len(parts) >= 2:
+                name = parts[-1]
+                if operator == "-eq" and name == value:
+                    result_lines.append(line)
+    
+    return success("\n".join(result_lines))
+
+
+def handle_foreach_object(piped_input: str) -> dict:
+    """ForEach-Object - Process each item"""
+    if not piped_input:
+        return success("")
+    
+    # Simple pass-through implementation
+    return success(piped_input)
+
+
 def execute_single(session: dict, command: str, piped_input: str = "") -> dict:
     assignment = parse_env_assignment(command)
     if assignment:
@@ -469,6 +918,66 @@ def execute_single(session: dict, command: str, piped_input: str = "") -> dict:
                 normalize_path(session["cwd"], tokens[2]),
             )
         )
+    if cmd == "measure-object":
+        return handle_measure_object(piped_input)
+    if cmd == "sort-object":
+        return handle_sort_object(session, tokens, piped_input)
+    if cmd == "select-object":
+        return handle_select_object(tokens, piped_input)
+    if cmd == "get-date":
+        if len(tokens) != 1:
+            return success(error("invalid_arguments"))
+        return handle_get_date()
+    if cmd == "get-location":
+        if len(tokens) != 1:
+            return success(error("invalid_arguments"))
+        return handle_get_location(session)
+    if cmd == "rename-item":
+        return handle_rename_item(session, tokens)
+    if cmd == "get-childitem":
+        return handle_get_childitem(session, tokens)
+    if cmd == "get-item":
+        return handle_get_item(session, tokens)
+    if cmd == "test-path":
+        return handle_test_path(session, tokens)
+    if cmd == "get-service":
+        if len(tokens) != 1:
+            return success(error("invalid_arguments"))
+        return handle_get_service(session)
+    if cmd == "start-service":
+        return handle_start_service(session, tokens)
+    if cmd == "stop-service":
+        return handle_stop_service(session, tokens)
+    if cmd == "restart-service":
+        return handle_restart_service(session, tokens)
+    if cmd == "test-connection":
+        return handle_test_connection(tokens)
+    if cmd == "get-netipconfig" or cmd == "get-netipconfiguration":
+        if len(tokens) != 1:
+            return success(error("invalid_arguments"))
+        return handle_ipconfig()
+    if cmd == "resolve-dnsname":
+        return handle_resolve_dnsname(tokens)
+    if cmd == "get-currentuser":
+        if len(tokens) != 1:
+            return success(error("invalid_arguments"))
+        return handle_whoami()
+    if cmd == "get-computername":
+        if len(tokens) != 1:
+            return success(error("invalid_arguments"))
+        return handle_hostname()
+    if cmd == "get-computerinfo":
+        if len(tokens) != 1:
+            return success(error("invalid_arguments"))
+        return handle_get_computerinfo()
+    if cmd == "compress-archive":
+        return handle_compress_archive(session, tokens)
+    if cmd == "expand-archive":
+        return handle_expand_archive(session, tokens)
+    if cmd == "where-object":
+        return handle_where_object(tokens, piped_input)
+    if cmd == "foreach-object":
+        return handle_foreach_object(piped_input)
     return success(error("invalid_command"))
 
 

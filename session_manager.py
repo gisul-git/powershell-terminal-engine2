@@ -8,6 +8,12 @@ DEFAULT_PROCESSES = [
     {"pid": 102, "name": "node"},
 ]
 
+DEFAULT_SERVICES = [
+    {"name": "Spooler", "status": "Running"},
+    {"name": "WinDefend", "status": "Running"},
+    {"name": "WSearch", "status": "Stopped"},
+]
+
 # Session storage for cleanup
 _sessions = {}
 
@@ -33,6 +39,7 @@ def create_session() -> dict:
         "history": [],
         "env": {},
         "processes": deepcopy(DEFAULT_PROCESSES),
+        "services": deepcopy(DEFAULT_SERVICES),
         "mode": "exam",
     }
     _sessions[id(session)] = session

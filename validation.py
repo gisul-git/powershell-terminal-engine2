@@ -13,6 +13,7 @@ ERRORS = {
     "cannot_remove_directory": "Cannot remove directory",
     "cannot_move_file": "Cannot move file",
     "same_file": "Cannot overwrite same file",
+    "service_not_found": "Service not found",
 }
 
 
