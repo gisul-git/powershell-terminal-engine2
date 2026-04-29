@@ -17,8 +17,13 @@ async def terminal_endpoint(websocket: WebSocket) -> None:
     PowerShell WebSocket terminal endpoint.
     Matches Linux bash engine behavior for stability and robustness.
     """
+    origin = websocket.headers.get("origin", "")
+    print(f"Origin: {origin}")
+
+    # Production traffic is terminated by nginx, so allow browser WebSocket
+    # requests from the configured public domains instead of rejecting by Origin.
     await websocket.accept()
-    print("WebSocket connected")
+    print("Accepted WebSocket")
     
     session = create_session()
     session_id = id(session)
@@ -41,6 +46,8 @@ async def terminal_endpoint(websocket: WebSocket) -> None:
             try:
                 message = await websocket.receive_json()
                 print(f"Received: {message}")
+            except WebSocketDisconnect:
+                raise
             except Exception as e:
                 logger.error(f"Invalid message format: {e}")
                 await websocket.send_json(
