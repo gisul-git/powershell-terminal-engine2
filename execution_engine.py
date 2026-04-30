@@ -1,9 +1,15 @@
 import asyncio
+import ipaddress
+import json
 import logging
-import random
+import re
 import shlex
+import socket
 from copy import deepcopy
-from typing import Iterable
+from typing import Callable, Iterable
+from urllib.error import URLError
+from urllib.parse import urlparse
+from urllib.request import Request, urlopen
 
 from path_resolver import HOME_PATH, ROOT_PATH, basename, normalize_path, parent_path
 from validation import error, has_flag, validate_flags
@@ -37,7 +43,30 @@ STOP_ERRORS = {
     error("cannot_move_file"),
     error("same_file"),
     error("service_not_found"),
+    error("variable_not_found"),
+    error("request_timeout"),
 }
+
+VARIABLE_NAME_PATTERN = re.compile(r"^\$([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.+)$")
+VARIABLE_REFERENCE_PATTERN = re.compile(r"\$([A-Za-z_][A-Za-z0-9_]*)")
+WEB_TIMEOUT_SECONDS = 5
+
+IPCONFIG_OUTPUT = "\n".join(
+    [
+        "IPv4 Address . . . . . : 192.168.1.10",
+        "Subnet Mask . . . . . : 255.255.255.0",
+        "Gateway . . . . . . . : 192.168.1.1",
+    ]
+)
+WHOAMI_OUTPUT = "User"
+HOSTNAME_OUTPUT = "WIN-SERVER01"
+COMPUTER_INFO_OUTPUT = "\n".join(
+    [
+        "OSName : Windows Server",
+        "OSVersion : 2022",
+        "ComputerName : WIN-SERVER01",
+    ]
+)
 
 
 def build_terminal_history(session: dict) -> str:
@@ -93,6 +122,24 @@ def parse_env_assignment(command: str) -> tuple[str, str] | None:
     if not key:
         return None
     return key, value
+
+
+def parse_variable_assignment(command: str) -> tuple[str, str] | None:
+    match = VARIABLE_NAME_PATTERN.match(command.strip())
+    if not match:
+        return None
+    name, value = match.groups()
+    return name, value.strip().strip('"').strip("'")
+
+
+def substitute_variables(session: dict, command: str) -> str:
+    variables = session.setdefault("variables", {})
+
+    def replace(match: re.Match) -> str:
+        name = match.group(1)
+        return str(variables.get(name, match.group(0)))
+
+    return VARIABLE_REFERENCE_PATTERN.sub(replace, command)
 
 
 def normalize_alias(command: str) -> str:
@@ -312,6 +359,12 @@ def handle_dir(session: dict, tokens: list[str]) -> dict:
     return success(list_directory(session, target))
 
 
+def handle_pwd(session: dict, tokens: list[str]) -> dict:
+    if len(tokens) != 1:
+        return success(error("invalid_arguments"))
+    return success(session["cwd"])
+
+
 def handle_new_item(session: dict, tokens: list[str]) -> dict:
     if not validate_flags(tokens[1:], {"-ItemType"}):
         return success(error("invalid_arguments"))
@@ -414,6 +467,38 @@ def handle_stop_process(session: dict, tokens: list[str]) -> dict:
     return success(error("item_missing"))
 
 
+def handle_write_output(tokens: list[str]) -> dict:
+    return success(" ".join(tokens[1:]).strip('"').strip("'"))
+
+
+def handle_copy_item_command(session: dict, tokens: list[str]) -> dict:
+    if len(tokens) < 3:
+        return success(error("missing_destination" if len(tokens) == 2 else "invalid_arguments"))
+    if len(tokens) != 3:
+        return success(error("invalid_arguments"))
+    return success(
+        copy_item(
+            session,
+            normalize_path(session["cwd"], tokens[1]),
+            normalize_path(session["cwd"], tokens[2]),
+        )
+    )
+
+
+def handle_move_item_command(session: dict, tokens: list[str]) -> dict:
+    if len(tokens) < 3:
+        return success(error("missing_destination" if len(tokens) == 2 else "invalid_arguments"))
+    if len(tokens) != 3:
+        return success(error("invalid_arguments"))
+    return success(
+        move_item(
+            session,
+            normalize_path(session["cwd"], tokens[1]),
+            normalize_path(session["cwd"], tokens[2]),
+        )
+    )
+
+
 def handle_measure_object(piped_input: str) -> dict:
     if not piped_input:
         return success("Count : 0")
@@ -504,6 +589,18 @@ def handle_select_object(tokens: list[str], piped_input: str) -> dict:
                 parts = line.split()
                 if len(parts) >= 7:
                     result_lines.append(parts[6])
+
+    if result_lines:
+        return success("\n".join(result_lines))
+
+    # Generic "key : value" support for Invoke-RestMethod and Get-Variable output.
+    normalized_property = property_name.lower()
+    for line in lines:
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        if key.strip().lower() == normalized_property:
+            result_lines.append(value.strip())
     
     return success("\n".join(result_lines))
 
@@ -555,6 +652,47 @@ def handle_get_childitem_env(session: dict) -> dict:
     for key, value in sorted(session["env"].items()):
         lines.append(f"{key:<12}{value}")
     return success("\n".join(lines))
+
+
+def handle_get_variable(session: dict, tokens: list[str]) -> dict:
+    variables = session.setdefault("variables", {})
+    if len(tokens) > 2:
+        return success(error("invalid_arguments"))
+
+    if len(tokens) == 2:
+        name = tokens[1].lstrip("$")
+        if name not in variables:
+            return success(error("variable_not_found"))
+        return success(f"Name : {name}\nValue : {variables[name]}")
+
+    if not variables:
+        return success("Name    Value\n----    -----")
+
+    lines = ["Name    Value", "----    -----"]
+    for name, value in sorted(variables.items()):
+        lines.append(f"{name:<7} {value}")
+    return success("\n".join(lines))
+
+
+def handle_set_variable(session: dict, tokens: list[str]) -> dict:
+    if len(tokens) < 3:
+        return success(error("invalid_arguments"))
+    name = tokens[1].lstrip("$")
+    if not name:
+        return success(error("invalid_arguments"))
+    session.setdefault("variables", {})[name] = " ".join(tokens[2:]).strip('"').strip("'")
+    return success()
+
+
+def handle_remove_variable(session: dict, tokens: list[str]) -> dict:
+    if len(tokens) != 2:
+        return success(error("invalid_arguments"))
+    name = tokens[1].lstrip("$")
+    variables = session.setdefault("variables", {})
+    if name not in variables:
+        return success(error("variable_not_found"))
+    variables.pop(name, None)
+    return success()
 
 
 def handle_get_childitem(session: dict, tokens: list[str]) -> dict:
@@ -684,12 +822,7 @@ def handle_test_connection(tokens: list[str]) -> dict:
 
 def handle_ipconfig() -> dict:
     """ipconfig / Get-NetIPConfiguration - Network info"""
-    lines = [
-        "IPv4 Address . . . . . : 192.168.1.10",
-        "Subnet Mask . . . . . : 255.255.255.0",
-        "Gateway . . . . . . . : 192.168.1.1"
-    ]
-    return success("\n".join(lines))
+    return success(IPCONFIG_OUTPUT)
 
 
 def handle_resolve_dnsname(tokens: list[str]) -> dict:
@@ -708,22 +841,17 @@ def handle_resolve_dnsname(tokens: list[str]) -> dict:
 
 def handle_whoami() -> dict:
     """whoami / Get-CurrentUser - Current user"""
-    return success("User")
+    return success(WHOAMI_OUTPUT)
 
 
 def handle_hostname() -> dict:
     """hostname / Get-ComputerName - Computer name"""
-    return success("WIN-SERVER01")
+    return success(HOSTNAME_OUTPUT)
 
 
 def handle_get_computerinfo() -> dict:
     """Get-ComputerInfo - System information"""
-    lines = [
-        "OSName : Windows Server",
-        "OSVersion : 2022",
-        "ComputerName : WIN-SERVER01"
-    ]
-    return success("\n".join(lines))
+    return success(COMPUTER_INFO_OUTPUT)
 
 
 def handle_compress_archive(session: dict, tokens: list[str]) -> dict:
@@ -852,138 +980,234 @@ def handle_foreach_object(piped_input: str) -> dict:
     return success(piped_input)
 
 
-def execute_single(session: dict, command: str, piped_input: str = "") -> dict:
+def normalize_url(raw_url: str) -> str:
+    url = raw_url.strip().strip('"').strip("'")
+    if not url.startswith(("http://", "https://")):
+        url = f"https://{url}"
+    return url
+
+
+def is_blocked_host(hostname: str | None) -> bool:
+    if not hostname:
+        return True
+    normalized = hostname.lower().strip("[]")
+    if normalized == "localhost" or normalized.endswith(".localhost"):
+        return True
+    try:
+        address = ipaddress.ip_address(normalized)
+        return (
+            address.is_loopback
+            or address.is_link_local
+            or address.is_private
+            or address.is_multicast
+            or address.is_unspecified
+        )
+    except ValueError:
+        return False
+
+
+def resolved_host_is_blocked(hostname: str) -> bool:
+    try:
+        address_info = socket.getaddrinfo(hostname, None, type=socket.SOCK_STREAM)
+    except socket.gaierror:
+        return False
+
+    for item in address_info:
+        address = item[4][0]
+        if is_blocked_host(address):
+            return True
+    return False
+
+
+def request_url(url: str) -> tuple[int, str, str]:
+    request = Request(url, headers={"User-Agent": "PowerShellEngine/1.0"})
+    with urlopen(request, timeout=WEB_TIMEOUT_SECONDS) as response:
+        raw_content = response.read()
+        charset = response.headers.get_content_charset() or "utf-8"
+        content = raw_content.decode(charset, errors="replace")
+        return response.status, response.geturl(), content
+
+
+def is_timeout_error(exc: BaseException) -> bool:
+    if isinstance(exc, (TimeoutError, socket.timeout)):
+        return True
+    if isinstance(exc, URLError):
+        return isinstance(exc.reason, (TimeoutError, socket.timeout))
+    return False
+
+
+def format_rest_data(data) -> str:
+    if isinstance(data, dict):
+        return "\n".join(f"{key} : {format_json_value(value)}" for key, value in data.items())
+    if isinstance(data, list):
+        return "\n".join(format_rest_data(item) for item in data)
+    return format_json_value(data)
+
+
+def format_json_value(value) -> str:
+    if isinstance(value, bool):
+        return str(value).lower()
+    if value is None:
+        return "null"
+    if isinstance(value, (dict, list)):
+        return json.dumps(value)
+    return str(value)
+
+
+def fallback_web_response(url: str) -> dict:
+    return success(f"StatusCode : 200\nContentLength : 1256\nUrl : {url}")
+
+
+def fallback_rest_response(url: str) -> dict:
+    if "jsonplaceholder.typicode.com/todos/1" in url:
+        return success("userId : 1\nid : 1\ntitle : sample task\ncompleted : false")
+    return success(f"url : {url}\nstatus : ok")
+
+
+async def handle_invoke_webrequest(session: dict, tokens: list[str], piped_input: str) -> dict:
+    if len(tokens) != 2:
+        return success(error("invalid_arguments"))
+    url = normalize_url(tokens[1])
+    parsed_url = urlparse(url)
+    if parsed_url.scheme not in {"http", "https"}:
+        return success(error("invalid_arguments"))
+    if is_blocked_host(parsed_url.hostname) or await asyncio.to_thread(resolved_host_is_blocked, parsed_url.hostname):
+        return success(error("access_denied"))
+
+    try:
+        status_code, final_url, content = await asyncio.to_thread(request_url, url)
+    except (URLError, TimeoutError, socket.timeout) as exc:
+        if is_timeout_error(exc):
+            return success(error("request_timeout"))
+        return fallback_web_response(url)
+    except Exception:
+        return fallback_web_response(url)
+
+    return success(f"StatusCode : {status_code}\nContentLength : {len(content)}\nUrl : {final_url}")
+
+
+async def handle_invoke_restmethod(session: dict, tokens: list[str], piped_input: str) -> dict:
+    if len(tokens) != 2:
+        return success(error("invalid_arguments"))
+    url = normalize_url(tokens[1])
+    parsed_url = urlparse(url)
+    if parsed_url.scheme not in {"http", "https"}:
+        return success(error("invalid_arguments"))
+    if is_blocked_host(parsed_url.hostname) or await asyncio.to_thread(resolved_host_is_blocked, parsed_url.hostname):
+        return success(error("access_denied"))
+
+    try:
+        status_code, final_url, content = await asyncio.to_thread(request_url, url)
+        return success(format_rest_data(json.loads(content)))
+    except (URLError, TimeoutError, socket.timeout) as exc:
+        if is_timeout_error(exc):
+            return success(error("request_timeout"))
+        return fallback_rest_response(url)
+    except json.JSONDecodeError:
+        return success(error("invalid_arguments"))
+    except Exception:
+        return fallback_rest_response(url)
+
+
+CommandHandler = Callable[[dict, list[str], str], dict]
+AsyncCommandHandler = Callable[[dict, list[str], str], object]
+
+
+def no_args(handler: Callable[[], dict]) -> CommandHandler:
+    def wrapped(session: dict, tokens: list[str], piped_input: str) -> dict:
+        if len(tokens) != 1:
+            return success(error("invalid_arguments"))
+        return handler()
+
+    return wrapped
+
+
+def session_no_args(handler: Callable[[dict], dict]) -> CommandHandler:
+    def wrapped(session: dict, tokens: list[str], piped_input: str) -> dict:
+        if len(tokens) != 1:
+            return success(error("invalid_arguments"))
+        return handler(session)
+
+    return wrapped
+
+
+COMMAND_MAP: dict[str, CommandHandler] = {
+    "cd": lambda session, tokens, piped_input: handle_cd(session, tokens),
+    "pwd": lambda session, tokens, piped_input: handle_pwd(session, tokens),
+    "dir": lambda session, tokens, piped_input: handle_dir(session, tokens),
+    "new-item": lambda session, tokens, piped_input: handle_new_item(session, tokens),
+    "remove-item": lambda session, tokens, piped_input: handle_remove_item(session, tokens),
+    "get-content": lambda session, tokens, piped_input: handle_get_content(session, tokens),
+    "set-content": lambda session, tokens, piped_input: handle_set_content(session, tokens, append=False),
+    "add-content": lambda session, tokens, piped_input: handle_set_content(session, tokens, append=True),
+    "select-string": lambda session, tokens, piped_input: handle_select_string(session, tokens, piped_input),
+    "get-process": session_no_args(handle_get_process),
+    "stop-process": lambda session, tokens, piped_input: handle_stop_process(session, tokens),
+    "write-output": lambda session, tokens, piped_input: handle_write_output(tokens),
+    "cls": lambda session, tokens, piped_input: success(clear=True),
+    "copy-item": lambda session, tokens, piped_input: handle_copy_item_command(session, tokens),
+    "move-item": lambda session, tokens, piped_input: handle_move_item_command(session, tokens),
+    "measure-object": lambda session, tokens, piped_input: handle_measure_object(piped_input),
+    "sort-object": lambda session, tokens, piped_input: handle_sort_object(session, tokens, piped_input),
+    "select-object": lambda session, tokens, piped_input: handle_select_object(tokens, piped_input),
+    "get-date": no_args(handle_get_date),
+    "get-location": session_no_args(handle_get_location),
+    "rename-item": lambda session, tokens, piped_input: handle_rename_item(session, tokens),
+    "get-childitem": lambda session, tokens, piped_input: handle_get_childitem(session, tokens),
+    "get-variable": lambda session, tokens, piped_input: handle_get_variable(session, tokens),
+    "set-variable": lambda session, tokens, piped_input: handle_set_variable(session, tokens),
+    "remove-variable": lambda session, tokens, piped_input: handle_remove_variable(session, tokens),
+    "get-item": lambda session, tokens, piped_input: handle_get_item(session, tokens),
+    "test-path": lambda session, tokens, piped_input: handle_test_path(session, tokens),
+    "get-service": session_no_args(handle_get_service),
+    "start-service": lambda session, tokens, piped_input: handle_start_service(session, tokens),
+    "stop-service": lambda session, tokens, piped_input: handle_stop_service(session, tokens),
+    "restart-service": lambda session, tokens, piped_input: handle_restart_service(session, tokens),
+    "test-connection": lambda session, tokens, piped_input: handle_test_connection(tokens),
+    "get-netipconfig": no_args(handle_ipconfig),
+    "get-netipconfiguration": no_args(handle_ipconfig),
+    "resolve-dnsname": lambda session, tokens, piped_input: handle_resolve_dnsname(tokens),
+    "get-currentuser": no_args(handle_whoami),
+    "get-computername": no_args(handle_hostname),
+    "get-computerinfo": no_args(handle_get_computerinfo),
+    "compress-archive": lambda session, tokens, piped_input: handle_compress_archive(session, tokens),
+    "expand-archive": lambda session, tokens, piped_input: handle_expand_archive(session, tokens),
+    "where-object": lambda session, tokens, piped_input: handle_where_object(tokens, piped_input),
+    "foreach-object": lambda session, tokens, piped_input: handle_foreach_object(piped_input),
+    "invoke-webrequest": handle_invoke_webrequest,
+    "invoke-restmethod": handle_invoke_restmethod,
+}
+
+
+async def execute_single(session: dict, command: str, piped_input: str = "") -> dict:
     assignment = parse_env_assignment(command)
     if assignment:
         key, value = assignment
         session["env"][key] = value
         return success()
 
-    normalized_command = normalize_alias(command)
+    variable_assignment = parse_variable_assignment(command)
+    if variable_assignment:
+        key, value = variable_assignment
+        session.setdefault("variables", {})[key] = value
+        return success()
+
+    normalized_command = normalize_alias(substitute_variables(session, command))
     tokens = tokenize(normalized_command)
     if not tokens:
         return success()
 
     cmd = tokens[0].lower()
-
-    if cmd == "cd":
-        return handle_cd(session, tokens)
-    if cmd == "pwd":
-        if len(tokens) != 1:
-            return success(error("invalid_arguments"))
-        return success(session["cwd"])
-    if cmd == "dir":
-        return handle_dir(session, tokens)
-    if cmd == "new-item":
-        return handle_new_item(session, tokens)
-    if cmd == "remove-item":
-        return handle_remove_item(session, tokens)
-    if cmd == "get-content":
-        return handle_get_content(session, tokens)
-    if cmd == "set-content":
-        return handle_set_content(session, tokens, append=False)
-    if cmd == "add-content":
-        return handle_set_content(session, tokens, append=True)
-    if cmd == "select-string":
-        return handle_select_string(session, tokens, piped_input)
-    if cmd == "get-process":
-        return handle_get_process(session)
-    if cmd == "stop-process":
-        return handle_stop_process(session, tokens)
-    if cmd == "write-output":
-        return success(" ".join(tokens[1:]).strip('"').strip("'"))
-    if cmd == "cls":
-        return success(clear=True)
-    if cmd == "copy-item":
-        if len(tokens) < 3:
-            return success(error("missing_destination" if len(tokens) == 2 else "invalid_arguments"))
-        if len(tokens) != 3:
-            return success(error("invalid_arguments"))
-        return success(
-            copy_item(
-                session,
-                normalize_path(session["cwd"], tokens[1]),
-                normalize_path(session["cwd"], tokens[2]),
-            )
-        )
-    if cmd == "move-item":
-        if len(tokens) < 3:
-            return success(error("missing_destination" if len(tokens) == 2 else "invalid_arguments"))
-        if len(tokens) != 3:
-            return success(error("invalid_arguments"))
-        return success(
-            move_item(
-                session,
-                normalize_path(session["cwd"], tokens[1]),
-                normalize_path(session["cwd"], tokens[2]),
-            )
-        )
-    if cmd == "measure-object":
-        return handle_measure_object(piped_input)
-    if cmd == "sort-object":
-        return handle_sort_object(session, tokens, piped_input)
-    if cmd == "select-object":
-        return handle_select_object(tokens, piped_input)
-    if cmd == "get-date":
-        if len(tokens) != 1:
-            return success(error("invalid_arguments"))
-        return handle_get_date()
-    if cmd == "get-location":
-        if len(tokens) != 1:
-            return success(error("invalid_arguments"))
-        return handle_get_location(session)
-    if cmd == "rename-item":
-        return handle_rename_item(session, tokens)
-    if cmd == "get-childitem":
-        return handle_get_childitem(session, tokens)
-    if cmd == "get-item":
-        return handle_get_item(session, tokens)
-    if cmd == "test-path":
-        return handle_test_path(session, tokens)
-    if cmd == "get-service":
-        if len(tokens) != 1:
-            return success(error("invalid_arguments"))
-        return handle_get_service(session)
-    if cmd == "start-service":
-        return handle_start_service(session, tokens)
-    if cmd == "stop-service":
-        return handle_stop_service(session, tokens)
-    if cmd == "restart-service":
-        return handle_restart_service(session, tokens)
-    if cmd == "test-connection":
-        return handle_test_connection(tokens)
-    if cmd == "get-netipconfig" or cmd == "get-netipconfiguration":
-        if len(tokens) != 1:
-            return success(error("invalid_arguments"))
-        return handle_ipconfig()
-    if cmd == "resolve-dnsname":
-        return handle_resolve_dnsname(tokens)
-    if cmd == "get-currentuser":
-        if len(tokens) != 1:
-            return success(error("invalid_arguments"))
-        return handle_whoami()
-    if cmd == "get-computername":
-        if len(tokens) != 1:
-            return success(error("invalid_arguments"))
-        return handle_hostname()
-    if cmd == "get-computerinfo":
-        if len(tokens) != 1:
-            return success(error("invalid_arguments"))
-        return handle_get_computerinfo()
-    if cmd == "compress-archive":
-        return handle_compress_archive(session, tokens)
-    if cmd == "expand-archive":
-        return handle_expand_archive(session, tokens)
-    if cmd == "where-object":
-        return handle_where_object(tokens, piped_input)
-    if cmd == "foreach-object":
-        return handle_foreach_object(piped_input)
-    return success(error("invalid_command"))
+    handler = COMMAND_MAP.get(cmd)
+    if not handler:
+        return success(error("invalid_command"))
+    result = handler(session, tokens, piped_input)
+    if hasattr(result, "__await__"):
+        return await result
+    return result
 
 
 async def execute_command(session: dict, command: str) -> dict:
-    await asyncio.sleep(random.uniform(0.1, 0.3))
-
     if not command:
         return success()
 
@@ -995,7 +1219,7 @@ async def execute_command(session: dict, command: str) -> dict:
     result = success()
 
     for index, part in enumerate(parts):
-        result = execute_single(session, part, result["output"] if index > 0 else "")
+        result = await execute_single(session, part, result["output"] if index > 0 else "")
         logger.debug("pipe output [%s] -> %s", part, result["output"])
         if result["output"] in STOP_ERRORS:
             break

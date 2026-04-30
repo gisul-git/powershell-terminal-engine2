@@ -1,14 +1,73 @@
 import asyncio
+import contextlib
 import logging
+import os
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 
 from execution_engine import build_terminal_history, execute_command
-from session_manager import create_session, delete_session, generate_prompt
+from session_manager import (
+    SESSION_TTL_SECONDS,
+    cleanup_idle_sessions,
+    generate_prompt,
+    get_or_create_session,
+    touch_session,
+)
 
 
 app = FastAPI(title="PowerShell Simulation")
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "WARNING").upper())
 logger = logging.getLogger(__name__)
+
+HEARTBEAT_INTERVAL_SECONDS = 20
+HEARTBEAT_TIMEOUT_SECONDS = 120
+
+
+async def cleanup_sessions_forever() -> None:
+    while True:
+        await asyncio.sleep(300)
+        removed_count = cleanup_idle_sessions(SESSION_TTL_SECONDS)
+        if removed_count:
+            logger.debug("Cleaned up %s idle sessions", removed_count)
+
+
+@app.on_event("startup")
+async def start_background_tasks() -> None:
+    app.state.session_cleanup_task = asyncio.create_task(cleanup_sessions_forever())
+
+
+@app.on_event("shutdown")
+async def stop_background_tasks() -> None:
+    task = getattr(app.state, "session_cleanup_task", None)
+    if task:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+
+async def send_json(websocket: WebSocket, send_lock: asyncio.Lock, payload: dict) -> None:
+    async with send_lock:
+        await websocket.send_json(payload)
+
+
+async def heartbeat_loop(
+    websocket: WebSocket,
+    send_lock: asyncio.Lock,
+    session: dict,
+    stop_event: asyncio.Event,
+) -> None:
+    while not stop_event.is_set():
+        await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
+        if stop_event.is_set():
+            return
+
+        idle_for = asyncio.get_running_loop().time() - session.get("last_ws_seen", 0)
+        if idle_for > HEARTBEAT_TIMEOUT_SECONDS:
+            logger.debug("Closing idle websocket for session %s", session["session_id"])
+            await websocket.close(code=1001)
+            return
+
+        await send_json(websocket, send_lock, {"type": "ping"})
 
 
 @app.websocket("/terminal")
@@ -18,39 +77,47 @@ async def terminal_endpoint(websocket: WebSocket) -> None:
     Matches Linux bash engine behavior for stability and robustness.
     """
     origin = websocket.headers.get("origin", "")
-    print(f"Origin: {origin}")
+    logger.debug("WebSocket origin: %s", origin)
 
     # Production traffic is terminated by nginx, so allow browser WebSocket
     # requests from the configured public domains instead of rejecting by Origin.
     await websocket.accept()
-    print("Accepted WebSocket")
+    requested_session_id = websocket.query_params.get("session_id") or websocket.query_params.get("token")
+    session = get_or_create_session(requested_session_id)
+    session["last_ws_seen"] = asyncio.get_running_loop().time()
+    session_id = session["session_id"]
+    send_lock = asyncio.Lock()
+    stop_event = asyncio.Event()
+    heartbeat_task = asyncio.create_task(heartbeat_loop(websocket, send_lock, session, stop_event))
     
-    session = create_session()
-    session_id = id(session)
-    
-    # Send INIT message immediately on connection
-    await websocket.send_json(
+    # Send INIT immediately. Heavy data stays lazy so first paint is fast.
+    await send_json(
+        websocket,
+        send_lock,
         {
             "type": "init",
             "data": {
-                "banner": "Windows PowerShell Simulation\n\n",
+                "session_id": session_id,
                 "prompt": generate_prompt(session),
             },
-        }
+        },
     )
-    print("INIT message sent")
 
     try:
         while True:
             # Safe message handling - catch invalid JSON/format
             try:
                 message = await websocket.receive_json()
-                print(f"Received: {message}")
+                session["last_ws_seen"] = asyncio.get_running_loop().time()
+                touch_session(session)
+                logger.debug("Received websocket message type: %s", message.get("type"))
             except WebSocketDisconnect:
                 raise
             except Exception as e:
-                logger.error(f"Invalid message format: {e}")
-                await websocket.send_json(
+                logger.warning("Invalid message format: %s", e)
+                await send_json(
+                    websocket,
+                    send_lock,
                     {
                         "type": "response",
                         "data": {
@@ -65,11 +132,13 @@ async def terminal_endpoint(websocket: WebSocket) -> None:
             
             # Ignore unsupported message types (resize, ping)
             if message_type == "resize":
-                print("Ignoring resize message")
                 continue
             
             if message_type == "ping":
-                print("Ignoring ping message")
+                await send_json(websocket, send_lock, {"type": "pong"})
+                continue
+
+            if message_type == "pong":
                 continue
 
             # Handle command execution
@@ -78,17 +147,17 @@ async def terminal_endpoint(websocket: WebSocket) -> None:
                 
                 # Handle special \submit command
                 if command == "\\submit":
-                    await asyncio.sleep(0.1)
-                    await websocket.send_json(
+                    await send_json(
+                        websocket,
+                        send_lock,
                         {
                             "type": "response",
                             "data": {
                                 "output": build_terminal_history(session),
                                 "prompt": generate_prompt(session),
                             },
-                        }
+                        },
                     )
-                    print("Sending response: submit history")
                     continue
                 
                 # Execute command
@@ -113,33 +182,36 @@ async def terminal_endpoint(websocket: WebSocket) -> None:
                 if result.get("clear"):
                     response_data["clear"] = True
                     
-                await websocket.send_json(
+                await send_json(
+                    websocket,
+                    send_lock,
                     {
                         "type": "response",
                         "data": response_data,
-                    }
+                    },
                 )
-                print("Sending response: command executed")
                 continue
 
             # Handle submit message type
             if message_type == "submit":
-                await asyncio.sleep(0.1)
-                await websocket.send_json(
+                await send_json(
+                    websocket,
+                    send_lock,
                     {
                         "type": "response",
                         "data": {
                             "output": build_terminal_history(session),
                             "prompt": generate_prompt(session),
                         },
-                    }
+                    },
                 )
-                print("Sending response: submit history")
                 continue
 
             # Unsupported message type
-            print(f"Unsupported message type: {message_type}")
-            await websocket.send_json(
+            logger.debug("Unsupported message type: %s", message_type)
+            await send_json(
+                websocket,
+                send_lock,
                 {
                     "type": "response",
                     "data": {
@@ -150,12 +222,15 @@ async def terminal_endpoint(websocket: WebSocket) -> None:
             )
             
     except WebSocketDisconnect:
-        print("WebSocket disconnected")
-        delete_session(session_id)
+        logger.debug("WebSocket disconnected for session %s", session_id)
     except Exception as e:
-        logger.error(f"WebSocket error: {e}")
-        delete_session(session_id)
+        logger.exception("WebSocket error for session %s: %s", session_id, e)
         try:
             await websocket.close()
         except Exception:
             pass
+    finally:
+        stop_event.set()
+        heartbeat_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await heartbeat_task

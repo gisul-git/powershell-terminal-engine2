@@ -5,4 +5,8 @@ services:
     build: .
     ports:
       - "4042:4042"
+    environment:
+      LOG_LEVEL: WARNING
+      GUNICORN_TIMEOUT: 3600
+      GUNICORN_KEEPALIVE: 120
     restart: always
