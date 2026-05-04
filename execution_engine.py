@@ -113,6 +113,31 @@ def get_option(tokens: Iterable[str], name: str) -> str | None:
     return None
 
 
+def parse_params(args: list[str]) -> dict[str, str | bool]:
+    """Parse PowerShell-style named parameters from arguments.
+    
+    Example:
+        New-Item -ItemType Directory -Name audit_case
+        Returns: {"ItemType": "Directory", "Name": "audit_case"}
+    """
+    params = {}
+    i = 0
+    while i < len(args):
+        if args[i].startswith("-"):
+            key = args[i][1:]  # Remove the leading dash
+            if i + 1 < len(args) and not args[i + 1].startswith("-"):
+                # Parameter has a value
+                params[key] = args[i + 1].strip('"').strip("'")
+                i += 2
+            else:
+                # Flag parameter (no value)
+                params[key] = True
+                i += 1
+        else:
+            i += 1
+    return params
+
+
 def parse_env_assignment(command: str) -> tuple[str, str] | None:
     if not command.startswith("$env:") or "=" not in command:
         return None
@@ -342,6 +367,12 @@ def select_string(text: str, needle: str) -> str:
 
 
 def handle_cd(session: dict, tokens: list[str]) -> dict:
+    """cd / Set-Location - Change directory.
+    
+    Supports:
+        cd path
+        Set-Location path
+    """
     if len(tokens) > 2:
         return success(error("invalid_arguments"))
     target = normalize_path(session["cwd"], tokens[1] if len(tokens) > 1 else HOME_PATH)
@@ -366,26 +397,36 @@ def handle_pwd(session: dict, tokens: list[str]) -> dict:
 
 
 def handle_new_item(session: dict, tokens: list[str]) -> dict:
-    if not validate_flags(tokens[1:], {"-ItemType"}):
+    """New-Item - Create files or directories with named parameters.
+    
+    Supports:
+        New-Item -ItemType Directory -Name audit_case
+        New-Item -ItemType File -Name events.log
+        New-Item path -ItemType Directory (legacy)
+    """
+    if len(tokens) < 2:
         return success(error("invalid_arguments"))
-
-    path_token = None
-    index = 1
-    while index < len(tokens):
-        token = tokens[index]
-        if token.lower() == "-itemtype":
-            index += 2
-            continue
-        if token.startswith("-"):
-            return success(error("invalid_arguments"))
-        if path_token is not None:
-            return success(error("invalid_arguments"))
-        path_token = token
-        index += 1
-
-    item_type = get_option(tokens, "-ItemType")
-    if not path_token or not item_type:
+    
+    params = parse_params(tokens[1:])
+    
+    # Check for -ItemType parameter
+    item_type = params.get("ItemType") or params.get("itemtype")
+    if not item_type:
         return success(error("invalid_arguments"))
+    
+    # Get path from -Name parameter or positional argument
+    path_token = params.get("Name") or params.get("name")
+    
+    if not path_token:
+        # Try to find positional argument (non-parameter token)
+        for token in tokens[1:]:
+            if not token.startswith("-") and token not in params.values():
+                path_token = token
+                break
+    
+    if not path_token:
+        return success(error("invalid_arguments"))
+    
     return success(create_item(session, normalize_path(session["cwd"], path_token), item_type))
 
 
@@ -410,9 +451,25 @@ def handle_get_content(session: dict, tokens: list[str]) -> dict:
     return success(read_error or content)
 
 
-def handle_set_content(session: dict, tokens: list[str], append: bool) -> dict:
+def handle_set_content(session: dict, tokens: list[str], append: bool, piped_input: str = "") -> dict:
+    """Set-Content / Add-Content - Write content to file.
+    
+    Supports:
+        Set-Content file.txt "content"
+        ... | Set-Content file.txt (pipeline input)
+    """
+    if piped_input:
+        # Pipeline mode: ... | Set-Content file.txt
+        if len(tokens) < 2:
+            return success(error("invalid_arguments"))
+        
+        target_path = normalize_path(session["cwd"], tokens[1])
+        return success(write_content(session, target_path, piped_input, append=append))
+    
+    # Direct mode: Set-Content file.txt "content"
     if len(tokens) < 3:
         return success(error("invalid_arguments"))
+    
     return success(
         write_content(
             session,
@@ -424,24 +481,32 @@ def handle_set_content(session: dict, tokens: list[str], append: bool) -> dict:
 
 
 def handle_select_string(session: dict, tokens: list[str], piped_input: str) -> dict:
+    """Select-String - Search for patterns in text.
+    
+    Supports:
+        Select-String "pattern" file.txt
+        ... | Select-String "pattern"
+    """
     if len(tokens) < 2:
         return success(error("invalid_arguments"))
 
+    # Case 1: Only pattern provided (piped input)
     if len(tokens) == 2:
         return success(select_string(piped_input, tokens[1].strip('"').strip("'")))
 
-    possible_path = normalize_path(session["cwd"], tokens[1])
+    # Case 2: Pattern and file provided: Select-String "pattern" file.txt
+    # tokens[1] is the pattern, tokens[2] is the file
+    pattern = tokens[1].strip('"').strip("'")
+    possible_path = normalize_path(session["cwd"], tokens[2])
+    
     if ensure_node(session, possible_path):
         read_error, content = read_content(session, possible_path)
         if read_error:
             return success(read_error)
-        pattern = " ".join(tokens[2:]).strip('"').strip("'")
-        if not pattern:
-            return success(error("invalid_arguments"))
         return success(select_string(content, pattern))
-
-    pattern = " ".join(tokens[1:]).strip('"').strip("'")
-    return success(select_string(piped_input, pattern))
+    
+    # File not found
+    return success(error("file_missing"))
 
 
 def handle_get_process(session: dict) -> dict:
@@ -452,18 +517,34 @@ def handle_get_process(session: dict) -> dict:
 
 
 def handle_stop_process(session: dict, tokens: list[str]) -> dict:
-    if len(tokens) == 2 and tokens[1].isdigit():
-        pid = tokens[1]
-    else:
-        if not validate_flags(tokens[1:], {"-Id"}):
+    """Stop-Process - Stop a process by ID.
+    
+    Supports:
+        Stop-Process -Id 102 -Force
+        Stop-Process 102 (legacy)
+    """
+    params = parse_params(tokens[1:])
+    
+    # Get PID from -Id parameter
+    pid = params.get("Id") or params.get("id")
+    
+    if not pid:
+        # Try legacy positional argument
+        if len(tokens) == 2 and tokens[1].isdigit():
+            pid = tokens[1]
+        else:
             return success(error("invalid_arguments"))
-        pid = get_option(tokens, "-Id")
-    if not pid or not pid.isdigit():
+    
+    if not str(pid).isdigit():
         return success(error("invalid_arguments"))
+    
+    pid_int = int(pid)
+    
     for process in session["processes"]:
-        if process["pid"] == int(pid):
-            session["processes"] = [item for item in session["processes"] if item["pid"] != int(pid)]
+        if process["pid"] == pid_int:
+            session["processes"] = [item for item in session["processes"] if item["pid"] != pid_int]
             return success()
+    
     return success(error("item_missing"))
 
 
@@ -971,12 +1052,18 @@ def handle_where_object(tokens: list[str], piped_input: str) -> dict:
     return success("\n".join(result_lines))
 
 
-def handle_foreach_object(piped_input: str) -> dict:
-    """ForEach-Object - Process each item"""
+def handle_foreach_object(tokens: list[str], piped_input: str) -> dict:
+    """ForEach-Object - Process each item in pipeline.
+    
+    Supports:
+        ... | ForEach-Object { $_.Line }
+        
+    Simplification: Ignores script blocks and returns input as-is.
+    """
     if not piped_input:
         return success("")
     
-    # Simple pass-through implementation
+    # Simple pass-through - ignore script blocks like { $_.Line }
     return success(piped_input)
 
 
@@ -1133,13 +1220,14 @@ def session_no_args(handler: Callable[[dict], dict]) -> CommandHandler:
 
 COMMAND_MAP: dict[str, CommandHandler] = {
     "cd": lambda session, tokens, piped_input: handle_cd(session, tokens),
+    "set-location": lambda session, tokens, piped_input: handle_cd(session, tokens),
     "pwd": lambda session, tokens, piped_input: handle_pwd(session, tokens),
     "dir": lambda session, tokens, piped_input: handle_dir(session, tokens),
     "new-item": lambda session, tokens, piped_input: handle_new_item(session, tokens),
     "remove-item": lambda session, tokens, piped_input: handle_remove_item(session, tokens),
     "get-content": lambda session, tokens, piped_input: handle_get_content(session, tokens),
-    "set-content": lambda session, tokens, piped_input: handle_set_content(session, tokens, append=False),
-    "add-content": lambda session, tokens, piped_input: handle_set_content(session, tokens, append=True),
+    "set-content": lambda session, tokens, piped_input: handle_set_content(session, tokens, append=False, piped_input=piped_input),
+    "add-content": lambda session, tokens, piped_input: handle_set_content(session, tokens, append=True, piped_input=piped_input),
     "select-string": lambda session, tokens, piped_input: handle_select_string(session, tokens, piped_input),
     "get-process": session_no_args(handle_get_process),
     "stop-process": lambda session, tokens, piped_input: handle_stop_process(session, tokens),
@@ -1173,7 +1261,7 @@ COMMAND_MAP: dict[str, CommandHandler] = {
     "compress-archive": lambda session, tokens, piped_input: handle_compress_archive(session, tokens),
     "expand-archive": lambda session, tokens, piped_input: handle_expand_archive(session, tokens),
     "where-object": lambda session, tokens, piped_input: handle_where_object(tokens, piped_input),
-    "foreach-object": lambda session, tokens, piped_input: handle_foreach_object(piped_input),
+    "foreach-object": lambda session, tokens, piped_input: handle_foreach_object(tokens, piped_input),
     "invoke-webrequest": handle_invoke_webrequest,
     "invoke-restmethod": handle_invoke_restmethod,
 }
