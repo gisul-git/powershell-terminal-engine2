@@ -5,7 +5,7 @@ from uuid import uuid4
 from path_resolver import HOME_PATH, ROOT_PATH
 
 
-SESSION_TTL_SECONDS = 2 * 60 * 60
+SESSION_TTL_SECONDS = 7200  # 120 minutes (2 hours)
 
 DEFAULT_PROCESSES = [
     {"pid": 101, "name": "powershell"},

@@ -14,4 +14,4 @@ COPY . .
 
 EXPOSE 4042
 
-CMD ["gunicorn", "-k", "gunicorn_worker.ProductionUvicornWorker", "-c", "gunicorn_conf.py", "main:app"]
+CMD ["gunicorn", "-k", "gunicorn_worker.ProductionUvicornWorker", "-c", "gunicorn_conf.py", "main:app", "--timeout", "7200", "--keep-alive", "300"]

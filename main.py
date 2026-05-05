@@ -19,8 +19,8 @@ app = FastAPI(title="PowerShell Simulation")
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "WARNING").upper())
 logger = logging.getLogger(__name__)
 
-HEARTBEAT_INTERVAL_SECONDS = 20
-HEARTBEAT_TIMEOUT_SECONDS = 120
+HEARTBEAT_INTERVAL_SECONDS = 30  # Send ping every 30 seconds
+HEARTBEAT_TIMEOUT_SECONDS = 300  # 5 minutes idle timeout for WebSocket
 
 
 async def cleanup_sessions_forever() -> None:
